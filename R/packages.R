@@ -10,6 +10,7 @@ suppressPackageStartupMessages({
   library(rbbt)
   library(rempsyc)
   library(readxl)
+  library(stringr)
   
   library(brms)
   library(tidyr)
@@ -33,6 +34,14 @@ suppressPackageStartupMessages({
   library(stats)
   library(tidyr)
   library(ggfortify)
+  library(bayestestR)
+  library(grid)
+  library(ggridges)
+  
+  library(blavaan)
+  library(lavaan)
+  
+  library(rphylopic)
 
 })
 

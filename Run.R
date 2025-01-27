@@ -21,60 +21,37 @@ View(tar_meta(targets_only = TRUE)) # simplified
 
 
 
-# Extras ------------------------------------------------------------------
-
-# # Example contrasts
-# c <- as_draws_df(tar_read(m1))$b_meanMinAge - as_draws_df(tar_read(m2))$b_meanMinAge
-# c <- as_draws_df(tar_read(m3))$b_meanMinAge - as_draws_df(tar_read(m4))$b_meanMinAge
-# c <- as_draws_df(tar_read(m5))$b_meanMinAge - as_draws_df(tar_read(m6))$b_meanMinAge
-# c <- as_draws_df(tar_read(m7))$b_meanMinAge - as_draws_df(tar_read(m8))$b_meanMinAge
-# c <- as_draws_df(tar_read(m9))$b_meanMinAge - as_draws_df(tar_read(m10))$b_meanMinAge
-# PI(c)
-# 
-# # Example R2 calculations
-# library(performance)
-# r2_bayes(tar_read(m1))
-# r2_bayes(tar_read(m2))
-# r2_bayes(tar_read(m3))
-# r2_bayes(tar_read(m4))
-# r2_bayes(tar_read(m5))
-# r2_bayes(tar_read(m6))
-# r2_bayes(tar_read(m7))
-# r2_bayes(tar_read(m8))
-# r2_bayes(tar_read(m9))
-# r2_bayes(tar_read(m10))
-# # marginal is fixed only, conditional is both
+# Using the maximum response value as the number of trials.
+# Make sure this isn't happening more broadly?
+# Try for regular brms_fit?
 
 
-# Examine network model fits
 
-# mods <- tar_read(brms_fit) 
-# mods[[1]]
-# mods[[2]]
-# mods[[3]]
-# mods[[4]] 
-# mods[[5]]
-# mods[[6]] 
-# mods[[7]]
-# mods[[8]]
-# mods[[9]]
-# mods[[10]]
-# mods[[11]]
-# mods[[12]]
-# mods[[13]]
-# mods[[14]]
-# mods[[15]]
-# mods[[16]]
-# mods[[17]]
-# mods[[18]]
-# mods[[19]]
-# mods[[20]]
-# mods[[21]]
-# mods[[22]]
-# mods[[23]]
-# mods[[24]] 
-# mods[[25]]
-# mods[[26]]
+
+
+# Paper insights
+
+# With a sparse network and prior that expects high edges, dyads with fewer data will get dragged down less (will be closer to innappropriately high prior)
+# Regular messing around with priors can be useful for navigating sparser vs. denser networks, zero-inflated prior is an extension of this
+# Yeah I'm not convinced I want to encode the zero-inflation thing... seems too strict
+# Concern with using a low prior: would need a LOT of data for a high edge weight to emerge
+# Bashing SRI for being certain about dyads never seen together being 0s -- similarly something desirable for our model is that 
+# dyads never seen together but with few opportunities may interact
+# For a single-prior model, boosting low probabilities helps fit to sparser network
+
+# Problem with low-centered prior is that you may not get adequate movement towards higher values when you need them -- this is something we can check of course
+# Compare relative to expectations from O'Brien work, for example; are we happy maxing out at 30-40% association indices, or do we think higher is justified?
+# Certainly one of the zero-inflated models we fit seems to be doing something kinda whacky; really high values, even higher than HWI...
+
+# Note that their fixed scenario has some moderate curve AND the 0s are almost always expected to be 0s... not sure what we think of this
+# Note that their x axis is much bigger though, so possible that you get a little uplift in the "never togethers" right around 0, seems like you do
+
+# Next section about diagnostic stuff should be useful...
+
+# Last sentence: No option is perfect: aim for incorporating previous knowledge, incorporating uncertainty, and testing for downstream pathologies
+
+
+
 
 
 ##########################

@@ -6,6 +6,7 @@ tar_source('R') # will do all in 'R' folder
 
 # Seed
 tar_option_set(seed = 1234)
+options(future.globals.maxSize = 1024 * 1024 * 1024)  # Increase limit to 1 GB
 
 # Variables
 suppressMessages(set_cmdstan_path(path='C:/Users/sjfwa/AppData/Local/R/cmdstan-2.33.1')) # cmdstan path
@@ -14,464 +15,801 @@ suppressMessages(set_cmdstan_path(path='C:/Users/sjfwa/AppData/Local/R/cmdstan-2
 list(
 
   
+  
   #######################################################################
   ## Read in data
-  tar_target(raw_photoData, read_data_excel('./input/LV_SS_Master_1988-2023_excel.xlsx')), ###### make a file watching target
-  tar_target(raw_envData, read_data('./input/Scotian_Shelf_1988-2019_edited_HW_environment.csv')),
   
-  # calculate Kappa statistic for classification of young animals
-  tar_target(kappa, young_NBW_kappa()),
+  # Photographic and environmental data
+  tar_target(raw_photoData, read_data_excel('./input/LV_SS_Master_1988-2023_excel.xlsx')), 
+
+  # Calculate Kappa statistic for classification of young animals 
+  tar_target(kappa, young_NBW_kappa(raw_photoData)),
+  
   
   
   #######################################################################
-  ## Calculate associations and run edge weight models
+  ## Define groups and social associations
   
   # process photo data
   tar_target(side_ungrouped, process_photoID(raw_photoData, 'Left', 'Gully')), # only left-sided photos from the Gully
-
-  # carve up some groups based on timing
+  
+  # Build nbw metadata
+  tar_target(nbw_meta_raw, build_nbw_metadata(raw_photoData, 'left')), ######
+  tar_target(nbw_meta, add_age_to_meta(nbw_meta_raw)), # Note, only including metadata for years after 2001
+  
+  # Defining groups
   tar_target(groups, carve_groups(side_ungrouped, nbw_meta)),
-  tar_target(group_df_all, merge(groups, nbw_meta, by=c('Title','year'),all.x=TRUE)),
-  tar_target(group_df, group_df_all[!is.na(sex),,]),
+  tar_target(group_df_all, merge(groups, nbw_meta, by=c('Title','year'),all.x=TRUE)), 
+  tar_target(group_df, group_df_all[!is.na(sex),,]), # cleave off individual-year combinations without sex information (including year < 2001)
+  
+  # Use tar_group to split dataframe by year
+  tar_group_by(group_df_all_grouped, group_df_all, year), 
+  tar_target(year_key, year_key(group_df_all_grouped)), # track year-group IDs
+  
+  # Calculate social associations within each year-specific dataframe, then combine the results back together
+  tar_target(group_associations, build_group_associations(group_df_all_grouped), pattern=map(group_df_all_grouped), iteration="list"), 
+  tar_target(group_associations_all, unlist_group_associations(group_associations)),
+  tar_target(group_associations_all_aggregated, aggregate_group_associations(group_associations_all)), # aggregated version just useful for summaries
   
   
   
-  ### Association edge weights
+  #######################################################################
+  ## Run social network models (estimate edge weights)
   
-  # group by year for annual networks
-  tar_group_by(side, side_ungrouped, year),
-  
-  # prepare binary association data for annual edge weight models
-  tar_target(associations, build_binary_association_data(side), pattern=map(side), iteration="list"), ######
-
-  # run edge weight models for each year
-  tar_target(brms_fit, brm(
-    formula = together ~ (1|dyad),
-    data = associations,
+  # Run edge weight models using multi-annual network structure
+  tar_target(brms_fit_group_multiAnnual, brm(
+    formula = together ~ (1|dyad_annual),
+    data = group_associations_all,
     family = bernoulli(),
     prior = c(
-     set_prior("normal(-1.5, 1.5)", class = "Intercept"),
-     set_prior("normal(0, 1)", class = "sd", group = "dyad", coef = "Intercept")),
+      set_prior("normal(-1.5, 1.5)", class = "Intercept"),
+      set_prior("normal(0, 1)", class = "sd", group = "dyad_annual", coef = "Intercept")),
     chains=4,
     cores=4,
-    control = list(adapt_delta = 0.95)),
-    pattern=map(associations), iteration='list'),
+    control = list(adapt_delta = 0.95))),
+  
   
   
   #######################################################################
   ## Prepare dataframes for modelling
   
-  tar_target(nodal_traits, extract_trait(brms_fit),
-             pattern=map(brms_fit), iteration='list'),
+  # Estimate nodal traits from annual edge weights
+  tar_target(nodal_traits_multiAnnual, extract_trait_multiAnnual(brms_fit_group_multiAnnual)),
   
+  # Combine estimates of annual nodal traits into dataframe
+  tar_target(combined_traits_ma, combine_trait_dfs_ma(nodal_traits_multiAnnual, year_key)), 
   
-  # combine trait dataframes from each year
-  tar_target(combined_traits, combine_trait_dfs(nodal_traits, side)),  # assume order is preserved for now and check based on side, then make it more robust secondarily
-  
-  
-  # build nbw metadata
-  tar_target(nbw_meta_raw, build_nbw_metadata(raw_photoData, 'left')), ###### side-specific meta?
-  tar_target(nbw_meta, add_age_to_meta(nbw_meta_raw)),
-  
-  
-  # merge traits and metadata for analysis dataframe
-  tar_target(model_df, merge(combined_traits, nbw_meta, by=c('year','Title'))),
-  
-  
-  # extract biopsy details
+  # Finalize dataframe for modelling
+  tar_target(model_df_ma_step1, merge(combined_traits_ma, nbw_meta, by=c('year','Title'))),
+  tar_target(model_df_ma_step2, model_df_ma_step1[,numYears2:=.N,by=Title]), # Only want individuals with at least 2 years in final dataframe to estimate change
+  tar_target(model_df_ma, add_degree_ma(side_ungrouped, group_associations_all, model_df_ma_step2, year_key)), ######
+
+  # Extract biopsy details for models with genetically-sexed individuals only
   tar_target(biopsy_titles, biopsySexTitles(raw_photoData)),
   
-  # final changes to dataframe
-  tar_target(model_df_temp_1, model_df[,eigen:=eigen-0.001,]),
-  tar_target(model_df_temp_2, model_df_temp_1[!(year_group %in% c(1,4,6,7,12,14,16,17,18,24)),,]), # Cut out years with very few observations 
-  tar_target(model_df_temp_3, model_df_temp_2[year>=2000,,]),
-  tar_target(model_df_temp, model_df_temp_3[,numYears2:=.N,by=Title]), # calculated based on span of analysis
-  tar_target(degree_df_all, add_degree(side, associations, model_df_temp)),
-  tar_target(degree_df, degree_df_all[!is.na(sex),,]),
+
+  
+  #######################################################################
+  ## Model social traits as a function of minimum age
+  
+  ### Group size ###############################
+  
+  tar_target(ma_m1, brm(
+    formula = gs ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = group_df[ageClass=='Adult' & numYears>1 & year>2000 & sex=='Male',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  tar_target(ma_m1_sd, brm(
+    formula = gs ~  meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = group_df[ ageClass=='Adult' & numYears>1 & year>2000 & sex=='Male',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.95),
+    prior = c(set_prior('normal(1, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd')))),
+  tar_target(ma_m1_biopsy, brm(
+    formula = gs ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = group_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears>1 & year>2000 & sex=='Male',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  tar_target(ma_m1_yearSpan, brm(
+    formula = gs ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = group_df[ageClass=='Adult' & numYears>1 & year>2000 & sex=='Male' & yearSpan>10,,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  
+  
+  tar_target(ma_m2, brm(
+    formula = gs ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = group_df[ageClass=='Adult' & numYears>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  tar_target(ma_m2_sd, brm(
+    formula = gs ~  meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = group_df[ ageClass=='Adult' & numYears>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    prior = c(set_prior('normal(1, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd')))),
+  tar_target(ma_m2_biopsy, brm(
+    formula = gs ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = group_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  tar_target(ma_m2_yearSpan, brm(
+    formula = gs ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = group_df[ageClass=='Adult' & numYears>1 & year>2000 & sex=='Female-Juvenile' & yearSpan>10,,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+
+
+  ### Degree ###################################
+  
+  tar_target(ma_m3, brm(
+    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
+            set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+            set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+            set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+            set_prior('exponential(1)', class='sd'),
+            set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  tar_target(ma_m3_sd, brm(
+    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd')))),
+  tar_target(ma_m3_biopsy, brm(
+    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  tar_target(ma_m3_yearSpan, brm(
+    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male' & yearSpan>10,,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  
+  tar_target(ma_m4, brm(
+    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  tar_target(ma_m4_sd, brm(
+    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd')))),
+  tar_target(ma_m4_biopsy, brm(
+    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  tar_target(ma_m4_yearSpan, brm(
+    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data =  model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile' & yearSpan>10,,],
+    family = 'Poisson',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  
+  
+  ### Centrality ###############################
+  
+  tar_target(ma_m5, brm(
+    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  tar_target(ma_m5_sd, brm(
+    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi')))),
+  tar_target(ma_m5_biopsy, brm(
+    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  tar_target(ma_m5_yearSpan, brm(
+    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male' & yearSpan>10,,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99))),
+  
+  tar_target(ma_m6, brm(
+    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  tar_target(ma_m6_sd, brm(
+    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi')))),
+  tar_target(ma_m6_biopsy, brm(
+    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 0.5)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 0.5)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 0.5)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  tar_target(ma_m6_yearSpan, brm(
+    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile' & yearSpan>10,,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  
+  
+  ### Strength #################################
+  
+  tar_target(ma_m7, brm(
+    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Gamma',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(0, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))), 
+  tar_target(ma_m7_sd, brm(
+    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Gamma',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(0, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd')))),
+  tar_target(ma_m7_biopsy, brm(
+    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Gamma',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(0, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))), 
+  tar_target(ma_m7_yearSpan, brm(
+    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male' & yearSpan>10,,],
+    family = 'Gamma',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(0, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  
+  tar_target(ma_m8, brm(
+    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Gamma',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(0, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  tar_target(ma_m8_sd, brm(
+    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Gamma',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(0, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd')))),
+  tar_target(ma_m8_biopsy, brm(
+    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Gamma',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.999),
+    prior = c(set_prior('normal(0, 1)', class='Intercept'),
+              set_prior('normal(0, 0.5)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 0.5)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 0.5)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  tar_target(ma_m8_yearSpan, brm(
+    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile' & yearSpan>10,,],
+    family = 'Gamma',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(0, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+
+ 
+  ### Edge #####################################
+  
+  tar_target(ma_m9, brm(
+    formula = medianEdge | mi(medianEdge_SD) ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  tar_target(ma_m9_sd, brm(
+    formula = medianEdge | mi(medianEdge_SD) ~  meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi')))),
+  tar_target(ma_m9_biopsy, brm(
+    formula = medianEdge | mi(medianEdge_SD) ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  tar_target(ma_m9_yearSpan, brm(
+    formula = medianEdge | mi(medianEdge_SD) ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male' & yearSpan>10,,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  
+  tar_target(ma_m10, brm(
+    formula = medianEdge | mi(medianEdge_SD) ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  tar_target(ma_m10_sd, brm(
+    formula = medianEdge | mi(medianEdge_SD) ~  meanMinAge + minimumAge + (1|Title) +  (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi')))),
+  tar_target(ma_m10_biopsy, brm(
+    formula = medianEdge | mi(medianEdge_SD) ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  tar_target(ma_m10_yearSpan, brm(
+    formula = medianEdge | mi(medianEdge_SD) ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
+    data = model_df_ma[ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile' & yearSpan>10,,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    control = list(adapt_delta = 0.99),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
+              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
+              set_prior('exponential(1)', class='sd'),
+              set_prior('gamma(0.01, 0.01)', class='phi'),
+              set_prior('lkj_corr_cholesky(1)', class='L')))),  
+  
   
   
   #######################################################################
-  ## Trait models
+  ## Modelling non-linear trends in social behaviour with minimum age
   
-  ## GROUP SIZE ##
-  
-  tar_target(m1, brm(
-    formula = gs ~ meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = group_df[ sex=='Male' & numYears>1 & ageClass=='Adult' & year>2000,,], 
+  tar_target(m12_smooth2, brm(
+    formula = gs ~ s(minimumAge, k=3, by=sex) + (1|Title) + (1|year),
+    data = group_df[ numYears>1 & ageClass=='Adult' & year>2000,,],
     family = 'Poisson',
     chains=4,
     cores=4,
     control = list(adapt_delta = 0.95),
     prior = c(set_prior('normal(1, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m2, brm(
-    formula = gs ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = group_df[ sex=='Female-Juvenile' & numYears>1 & ageClass=='Adult' & year>2000,,], 
-    family = 'Poisson',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.95),
-    prior = c(set_prior('normal(1, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m2b, brm(
-    formula = gs ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = group_df[ sex=='Female-Juvenile' & numYears>1 & ageClass=='Adult' & year>2000 & yearSpan>10,,], 
-    family = 'Poisson',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.95),
-    prior = c(set_prior('normal(1, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m1biopsy, brm(
-    formula = gs ~ meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = group_df[Title %in% biopsy_titles & sex=='Male' & numYears>1 & ageClass=='Adult' & year>2000,,], 
-    family = 'Poisson',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.95),
-    prior = c(set_prior('normal(1, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m2biopsy, brm(
-    formula = gs ~  meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = group_df[Title %in% biopsy_titles & sex=='Female-Juvenile' & numYears>1 & ageClass=='Adult' & year>2000,,], 
-    family = 'Poisson',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(0.5, 1)', class='Intercept'),
-              set_prior('normal(0, 0.5)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 0.5)', class='b', coef='meanMinAge'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
+              # set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              set_prior('exponential(1)', class='sd')))),
   
-
-
-  ## NUMBER OF SOCIAL PARTNERS ##
-
-  tar_target(m3, brm(
-    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+  tar_target(m34_smooth2, brm(
+    formula = degree ~ numSamplingPeriodsByYear + s(minimumAge, k=3, by=sex) + (1|Title) + (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000,,],
     family = 'Poisson',
     chains=4,
     cores=4,
     control = list(adapt_delta = 0.95),
     prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m4, brm(
-    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
-    family = 'Poisson',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m4b, brm(
-    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile' & yearSpan>10,,],
-    family = 'Poisson',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m3biopsy, brm(
-    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
-    family = 'Poisson',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.95),
-    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m4biopsy, brm(
-    formula = degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
-    family = 'Poisson',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  
-  
-  ## CENTRALITY ##
-
-  tar_target(m5, brm(
-    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.95),
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('gamma(0.01, 0.01)', class='phi'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m6, brm(
-    formula = eigen ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('gamma(0.01, 0.01)', class='phi'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m6b, brm(
-    formula = eigen ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile' & yearSpan>10,,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('gamma(0.01, 0.01)', class='phi'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m5biopsy, brm(
-    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) +  (1|year),
-    data = degree_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('gamma(0.01, 0.01)', class='phi'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m6biopsy, brm(
-    formula = eigen ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('gamma(0.01, 0.01)', class='phi'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  
-
-  
-  ## STRENGTH ##
-  
-  tar_target(m7, brm(
-    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
-    family = 'Gamma',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(0, 1)', class='Intercept'),
-            set_prior('normal(0, 1)', class='b'),
+            # set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+            # set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
             set_prior('exponential(1)', class='sd')))),
-  tar_target(m8, brm(
-    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
-    family = 'Gamma',
+  
+  tar_target(m56_smooth2, brm(
+    formula = eigen | mi(eigen_SD) ~ numSamplingPeriodsByYear + s(minimumAge, k=3, by=sex) + (1|Title) +  (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000,,],
+    family = 'Beta',
     chains=4,
     cores=4,
     control = list(adapt_delta = 0.95),
-    prior = c(set_prior('normal(0, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b'),
-              set_prior('exponential(1)', class='sd')))),
-  tar_target(m8b, brm(
-    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears>1 & year>2000 & sex=='Female-Juvenile' & yearSpan>10,,],
-    family = 'Gamma',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(0, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b'),
-              set_prior('exponential(1)', class='sd')))),
-  tar_target(m7biopsy, brm(
-    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
-    family = 'Gamma',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(0, 1)', class='Intercept'),
-            set_prior('normal(0, 1)', class='b'),
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+            # set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+            # set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
             set_prior('exponential(1)', class='sd')))),
-  tar_target(m8biopsy, brm(
-    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+  
+  tar_target(m78_smooth2, brm(
+    formula = strength | mi(strength_SD) ~ numSamplingPeriodsByYear + s(minimumAge, k=3, by=sex) + (1|Title) + (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1 & year>2000,,],
     family = 'Gamma',
     chains=4,
     cores=4,
     control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(1, 0.5)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b'),
+    prior = c(set_prior('normal(1.5, 1)', class='Intercept'),
+              # set_prior('normal(0, 1)', class='b', coef='minimumAge'),
+              # set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
+              set_prior('exponential(1)', class='sd')))),
+  
+  tar_target(m910_smooth2, brm(
+    formula = medianEdge | mi(medianEdge_SD) ~ s(minimumAge, k=3, by=sex) + (1|Title) + (1|year),
+    data = model_df_ma[ ageClass=='Adult' & numYears2>1  & year>2000,,],
+    family = 'Beta',
+    chains=4,
+    cores=4,
+    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
+              # set_prior('normal(0, 1)', class='b', coef='minimumAge'),
               set_prior('exponential(1)', class='sd')))),
   
   
-  ## MEAN RELATIONSHIP STRENGTH ## 
   
-  tar_target(m9, brm(
-    formula = medianEdge ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-            set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-            set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-            set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-            set_prior('exponential(1)', class='sd'),
-            set_prior('gamma(0.01, 0.01)', class='phi'),
-            set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m10, brm(
-    formula = medianEdge ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1  & year>2000 & sex=='Female-Juvenile',,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-            set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-            set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-            set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-            set_prior('exponential(1)', class='sd'),
-            set_prior('gamma(0.01, 0.01)', class='phi'),
-            set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m10b, brm(
-    formula = medianEdge ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[ ageClass=='Adult' & numYears2>1  & year>2000 & sex=='Female-Juvenile' & yearSpan>10,,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('gamma(0.01, 0.01)', class='phi'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m9biopsy, brm(
-    formula = medianEdge ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('gamma(0.01, 0.01)', class='phi'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
-  tar_target(m10biopsy, brm(
-    formula = medianEdge ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|Title) + (1|year),
-    data = degree_df[Title %in% biopsy_titles & ageClass=='Adult' & numYears2>1  & year>2000 & sex=='Female-Juvenile',,],
-    family = 'Beta',
-    chains=4,
-    cores=4,
-    control = list(adapt_delta = 0.99),
-    prior = c(set_prior('normal(-0.5, 1)', class='Intercept'),
-              set_prior('normal(0, 1)', class='b', coef='deltaMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='meanMinAge'),
-              set_prior('normal(0, 1)', class='b', coef='numSamplingPeriodsByYear'),
-              set_prior('exponential(1)', class='sd'),
-              set_prior('gamma(0.01, 0.01)', class='phi'),
-              set_prior('lkj_corr_cholesky(1)', class='L')))),
+  #######################################################################
+  ## Multi-response analyses
   
+  # Collapse group size into annual measure
+  tar_target(group_df_with_means, group_df[,gs_annual:=mean(gs), by=c('Title','year')]),
+  
+  # Fit multi-response models
+  tar_target(m_multi_m_ma, brm(formula=
+                                 bf(gs_annual ~ meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Gamma')+
+                                 bf(medianEdge ~ meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Beta')+
+                                 bf(strength ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Gamma')+
+                                 bf(eigen ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Beta')+
+                                 bf(degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Poisson'),
+                               data=multi_dataset_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Male',,],
+                               iter=4000, chains=4, cores=4)),
+  
+  tar_target(m_multi_f_ma, brm(formula=
+                                 bf(gs_annual ~ meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Gamma')+
+                                 bf(medianEdge ~ meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Beta')+
+                                 bf(strength ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Gamma')+
+                                 bf(eigen ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Beta')+
+                                 bf(degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Poisson'),
+                               data=multi_dataset_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex=='Female-Juvenile',,],
+                               iter=4000, chains=4, cores=4)),
+  
+  tar_target(m_multi_both_ma, brm(formula=
+                                    bf(gs_annual ~ meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Gamma')+
+                                    bf(medianEdge ~ meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Beta')+
+                                    bf(strength ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Gamma')+
+                                    bf(eigen ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Beta')+
+                                    bf(degree ~ numSamplingPeriodsByYear + meanMinAge + deltaMinAge + (deltaMinAge|p|Title) + (1|year), family='Poisson'),
+                                  data=multi_dataset_ma[ ageClass=='Adult' & numYears2>1 & year>2000 & sex %in% c('Male','Female-Juvenile'),,],
+                                  iter=4000, chains=4, cores=4)),
+  
+  # Extract within-individual effects
+  tar_target(within_effects_f_ma, extract_within_effects_sex_specific(multi_dataset_ma, m_multi_f_ma)),
+  tar_target(within_effects_m_ma, extract_within_effects_sex_specific(multi_dataset_ma, m_multi_m_ma)),
+  
+  tar_target(within_effects_ma, extract_within_effects(multi_dataset_ma, m_multi_both_ma)),
+  
+
+  tar_target(multi_dataset_ma, merge(model_df_ma, unique(group_df_with_means[,c('Title','year','gs_annual'),]), all.x=TRUE)),
+  
+  
+
   
   
   #######################################################################
   ## Figures
   
-  tar_target(Figure1, save_figure('./Manuscript/Figures/Figure1.png',w=15,h=5,
-                                  (within_between_plot(m3, 'degree', 'Number of partners','Male') | 
-                                     within_between_plot(m4, 'degree', 'Number of partners','Female') |
-                                     sex_coef_plot(m3, m4)) + plot_annotation(tag_levels = 'A',
-                                                                              title = 'Number of social partners',
-                                                                              theme = theme(plot.title = element_text(size = 18))))),
-  
+  tar_target(Figure1, save_figure('./Manuscript/Figures/Figure1.png',w=12,h=2.5,
+                                      (smooth_plot(m12_smooth2, 'gs', 'Group size', FALSE, TRUE) |
+                                         smooth_plot(m34_smooth2, 'degree', 'Number of social partners', FALSE, FALSE) |
+                                         smooth_plot(m56_smooth2, 'eigen', 'Centrality', FALSE, FALSE) |
+                                         smooth_plot(m78_smooth2, 'strength', 'Social strength', FALSE, FALSE) |
+                                         smooth_plot(m910_smooth2, 'medianEdge', 'Mean relationship strength', FALSE, FALSE)))),
   
   tar_target(Figure2, save_figure('./Manuscript/Figures/Figure2.png',w=15,h=5,
-                                  (within_between_plot(m5, 'eigen', 'Centrality','Male') | 
-                                     within_between_plot(m6, 'eigen', 'Centrality','Female') |
-                                     sex_coef_plot(m5, m6)) + plot_annotation(tag_levels = 'A',
-                                                                              title = 'Eigenvectory centrality',
-                                                                              theme = theme(plot.title = element_text(size = 18))))), 
-  
-  
+                                  (within_between_plot(ma_m1, 'gs', 'Group size','Male') |
+                                     within_between_plot(ma_m2, 'gs', 'Group size','Female') |
+                                     (sex_coef_plot(ma_m1, ma_m2)) / var_plot(ma_m1, ma_m2)) +
+                                    plot_annotation(tag_levels = 'A',
+                                                    title = 'Group size',
+                                                    theme = theme(plot.title = element_text(size = 18))))),
+
   tar_target(Figure3, save_figure('./Manuscript/Figures/Figure3.png',w=15,h=5,
-                                  (within_between_plot(m9, 'medianEdge', 'Mean bond strength','Male') | 
-                                     within_between_plot(m10,  'medianEdge', 'Mean bond strength','Female') |
-                                     sex_coef_plot(m9, m10)) + plot_annotation(tag_levels = 'A',
-                                                                               title = 'Mean bond strength',
-                                                                               theme = theme(plot.title = element_text(size = 18))))), 
+                                  (within_between_plot(ma_m3, 'degree', 'Number of partners','Male') |
+                                     within_between_plot(ma_m4, 'degree', 'Number of partners','Female') |
+                                     (sex_coef_plot(ma_m3, ma_m4)) / var_plot(ma_m3, ma_m4)) +
+                                    plot_annotation(tag_levels = 'A',
+                                                    title = 'Number of social partners',
+                                                    theme = theme(plot.title = element_text(size = 18))))),
+
+  tar_target(Figure4, save_figure('./Manuscript/Figures/Figure4.png',w=15,h=5,
+                                  (within_between_plot(ma_m7, 'strength', 'Strength','Male') |
+                                     within_between_plot(ma_m8, 'strength', 'Strength','Female') |
+                                     (sex_coef_plot(ma_m7, ma_m8)) / var_plot(ma_m7, ma_m8)) +
+                                    plot_annotation(tag_levels = 'A',
+                                                    title = 'Social network strength',
+                                                    theme = theme(plot.title = element_text(size = 18))))),
+
+  tar_target(Figure5, save_figure('./Manuscript/Figures/Figure5.png',w=15,h=5,
+                                  (within_between_plot(ma_m5, 'eigen', 'Centrality','Male') |
+                                     within_between_plot(ma_m6, 'eigen', 'Centrality','Female') |
+                                     (sex_coef_plot(ma_m5, ma_m6)) / var_plot(ma_m5, ma_m6)) +
+                                    plot_annotation(tag_levels = 'A',
+                                                    title = 'Eigenvectory centrality',
+                                                    theme = theme(plot.title = element_text(size = 18))))),
+
+  tar_target(Figure6, save_figure('./Manuscript/Figures/Figure6.png',w=15,h=5,
+                                  (within_between_plot(ma_m9, 'medianEdge', 'Mean relationship strength','Male') |
+                                     within_between_plot(ma_m10,  'medianEdge', 'Mean bond strength','Female') |
+                                     (sex_coef_plot(ma_m9, ma_m10)) / var_plot(ma_m9, ma_m10)) +
+                                    plot_annotation(tag_levels = 'A',
+                                                    title = 'Mean relationship strength',
+                                                    theme = theme(plot.title = element_text(size = 18))))),
   
   
-  tar_target(Figure4, save_figure('./Manuscript/Figures/Figure4.png',w=5,h=5,
-                                  pca_plot(m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, biopsy_titles))), 
+  #######################################################################
+  ## Supplemental figures
   
   
-  tar_target(FigureS1, save_figure('./Manuscript/Figures/FigureS1.png',w=15,h=5,
-                                  (within_between_plot(m1, 'gs', 'Group size','Male') | 
-                                     within_between_plot(m2, 'gs', 'Group size','Female') |
-                                     sex_coef_plot(m1, m2)) + plot_annotation(tag_levels = 'A',
-                                                                              title = 'Group size',
-                                                                              theme = theme(plot.title = element_text(size = 18))))), 
+  tar_target(FigureS1, save_figure('./Manuscript/Figures/FigureS1.png',w=11,h=8,
+                                  plot_within_effects_sex_specific(within_effects_m_ma, within_effects_f_ma))),
+  
+
+  tar_target(FigureS2, save_figure('./Manuscript/Figures/FigureS2.png',w=11,h=8,
+                                  plot_slope_correlations(m_multi_m_ma, m_multi_f_ma))),
+
+  
+  tar_target(FigureS3, save_figure('./Manuscript/Figures/FigureS3.png',w=12,h=6,
+                                   (age_histogram(group_df, 'Male') | age_histogram(group_df, 'Female-Juvenile')))),
+                                
   
   
-  tar_target(FigureS2, save_figure('./Manuscript/Figures/FigureS2.png',w=15,h=5,
-                                  (within_between_plot(m7, 'strength', 'Strength','Male') | 
-                                     within_between_plot(m8, 'strength', 'Strength','Female') |
-                                     sex_coef_plot(m7, m8)) + plot_annotation(tag_levels = 'A',
-                                                                              title = 'Social network strength',
-                                                                              theme = theme(plot.title = element_text(size = 18))))), 
+  #######################################################################
+  ## Additional figures (unused)
+  
+  # Correlations of within-individual effects from model with both sexes combined
+  tar_target(FigureX1, save_figure('./Manuscript/Figures/FigureX2.png',w=11,h=8,
+                                   plot_within_effects(within_effects_ma))),
+  
+  # Smooth effects showing raw data
+  tar_target(FigureX2, save_figure('./Manuscript/Figures/FigureX2.png', w=12, h=4,
+                                   (smooth_plot(m12_smooth2, 'gs', 'Group size', TRUE, FALSE) |
+                                      smooth_plot(m34_smooth2, 'degree', 'Number of social partners', TRUE, FALSE) |
+                                      smooth_plot(m56_smooth2, 'eigen', 'Centrality', TRUE, FALSE) |
+                                      smooth_plot(m78_smooth2, 'strength', 'Social strength', TRUE, FALSE) |
+                                      smooth_plot(m910_smooth2, 'medianEdge', 'Mean relationship strength', TRUE, TRUE)))),
+  
   
   
   #######################################################################
@@ -479,19 +817,33 @@ list(
   
   tar_quarto(
     supplement,
-    file.path('Manuscript','Supplement_SocialAgeing.qmd')),  
+    file.path('Manuscript','Supplement_SocialAgeing.qmd')),
+  
   
   #######################################################################
   ## Write manuscript
-
-  # tar_quarto(
-  #   paper,
-  #   file.path('Manuscript','MS_SocialAgeing.qmd')),
   
   tar_quarto(
     paper_iScience,
     file.path('Manuscript','MS_SocialAgeing_iScience.qmd'))
-
-
+  
+  
 )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
