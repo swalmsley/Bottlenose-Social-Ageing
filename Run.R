@@ -20,10 +20,61 @@ View(tar_meta()) # useful tool for diagnostics
 View(tar_meta(targets_only = TRUE)) # simplified
 
 
+fit <- tar_read(ma_m2)
+c <- coef(fit, prob=c(0.05, 0.95))$Title
 
-# Using the maximum response value as the number of trials.
-# Make sure this isn't happening more broadly?
-# Try for regular brms_fit?
+######
+# years <- years[!years %in% c(4, 18)]
+###### Specify and review this!
+
+# take random draws instead of first 100? ######
+
+
+###### NO Male-Male associations in 1993? Pretty weird...
+###### This needs to be investigated
+
+
+######   # results from just 3 ff in 2006, potentially all associated -- sample size does matter for global network properties
+# check that not also true of nodal properties... I suppose only thing it doesn't matter for is edge weights themselves
+
+###### confirm that we're applying inv_logit to samples prior to taking mean, and so on? also more feedback on this would be nice (check bisonR)
+
+
+####### check inv_logit everywhere, also post on brms forum
+
+###### make sure SD not stressing out models
+
+###### review poisson priors
+
+###### mention 1000 draws in text
+
+###### took off SD for several models - put it back on
+
+###### check edge_sex_associations - seems to be broken in Relationships!! 
+
+
+library(ggplot2)
+library(dplyr)
+
+
+
+
+plot_within_slopes(tar_read(ma_m1))
+plot_within_slopes(tar_read(ma_m2))
+
+plot_within_slopes(tar_read(ma_m3))
+plot_within_slopes(tar_read(ma_m4))
+
+plot_within_slopes(tar_read(ma_m5))
+plot_within_slopes(tar_read(ma_m6))
+
+plot_within_slopes(tar_read(ma_m7))
+plot_within_slopes(tar_read(ma_m8))
+
+plot_within_slopes(tar_read(ma_m9))
+plot_within_slopes(tar_read(ma_m10))
+
+
 
 
 
@@ -58,7 +109,7 @@ View(tar_meta(targets_only = TRUE)) # simplified
 # Calculating predictions
 ##########################
 
-# pred_data <- expand.grid(deltaMinAge = c(-15,0,15), 
+# pred_data <- expand.grid(deltaMinAge = c(-15,0,15),
 #                          sex = 'Male',
 #                          Title = NA,
 #                          numSamplingPeriodsByYear=2.4,
@@ -67,7 +118,7 @@ View(tar_meta(targets_only = TRUE)) # simplified
 #                          eigen_SD=0.1)
 # pred <- data.table(epred_draws(tar_read(m5), pred_data, re_formula = NA)) # N.B. 'NULL' means it INCLUDES conditional effects!
 # pred[,mean(.epred),by=deltaMinAge]
-# 
+
 # pred_data <- expand.grid(deltaMinAge = c(-15,0,15), 
 #                          sex = 'Female-Juvenile',
 #                          Title = NA,

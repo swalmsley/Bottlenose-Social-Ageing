@@ -117,6 +117,38 @@ brms_table <- function(fit) {
 
 
 
+# Coefficients table (brms) -----------------------------------------------
+brms_table_gam <- function(fit) {
+  
+  s <- summary(fit, prob = 0.9)
+  
+  fixed <- data.table(as.data.frame(s$fixed))
+  Title <- data.table(as.data.frame(s$random$Title))
+  year  <- data.table(as.data.frame(s$random$year))
+  smooth <- if (!is.null(s$spec_pars)) data.table(as.data.frame(s$spec_pars)) else NULL
+  
+  raw.table <- rbindlist(list(fixed, Title, year, smooth), fill = TRUE)
+  
+  terms <- c(row.names(s$fixed),
+             row.names(s$random$Title),
+             row.names(s$random$year),
+             if (!is.null(s$spec_pars)) row.names(s$spec_pars))
+  
+  stats.table <- cbind(terms, raw.table)
+  setnames(stats.table, old = names(stats.table),
+           new = c("Term", "Estimate", "SE", "PI-Lower", "PI-Upper", "Rhat", "Bulk_ESS", "Tail_ESS")[1:ncol(stats.table)])
+  
+  # drop diagnostics if present
+  drop_cols <- intersect(c("Rhat","Bulk_ESS","Tail_ESS"), names(stats.table))
+  if (length(drop_cols)) stats.table[, (drop_cols) := NULL]
+  
+  nice_table(stats.table)
+}
+#fit <- tar_read(m12_smooth2)
+
+
+
+
 
 # Compare calf/juv classifications ----------------------------------------
 young_NBW_kappa <- function(raw_photoData) {
@@ -134,7 +166,6 @@ young_NBW_kappa <- function(raw_photoData) {
   claire <- unique(claire[,c('Title','Claire_ageClass','year')])
   claire$Title <- as.character(claire$Title)
   unique(claire[,.N,by=c('year','Title')]$N) # expect 1
-  # there is a 2 here now
 
   # 1990 28, 1994 390, 2016 6240
 
@@ -144,14 +175,14 @@ young_NBW_kappa <- function(raw_photoData) {
   claire <- claire[!(year==2016 & Title=='6240' & Claire_ageClass=='none'),,] # assuming Juv
 
   unique(claire[,.N,by=c('year','Title')]$N) # expect 1 now that errors have been fixed/assumedunique(claire[,.N,by=c('year','Title')]$N) # expect 1
-
+  ###### add these to update sheet
 
   # Prep raw version
 
   original <- raw_photoData
 
-  original[, ageClass:=ifelse(grepl('samJuv', Keyword.export),'Juv','none'),]
-  original[ageClass!='Juv', ageClass:=ifelse(grepl('samCalf', Keyword.export),'Calf','none'),]
+  original[, ageClass:=ifelse(grepl('ageJuv', Keyword.export),'Juv','none'),]
+  original[ageClass!='Juv', ageClass:=ifelse(grepl('ageCalf', Keyword.export),'Calf','none'),]
   original[,.N,by='ageClass']
 
   original[,year:=year(`Date.Original`),]
@@ -163,7 +194,8 @@ young_NBW_kappa <- function(raw_photoData) {
   original <- original[!(year==2015 & Title=='5059' & ageClass=='none'),,]
   original <- original[!(year==2015 & Title=='6172' & ageClass=='none'),,]
   original <- original[!(year==2021 & Title=='6527' & ageClass=='none'),,]
-
+  ######
+  
   original <- original[Title!='see crops' & Title!='unk',,]
   claire <- claire[Title!='see crops' & Title!='unk',,]
 
@@ -171,19 +203,30 @@ young_NBW_kappa <- function(raw_photoData) {
 
 
   compare <- merge(original[Title!='unk' & Title!='see crops',c('Title','ageClass','year'),], claire[Title!='unk' & Title!='see crops',,], by=c('Title','year'))
-
+  compare <- compare[year<=2023,,] # Claire only did classifications up to 2023 
 
   return(kappam.fleiss(compare[,3:4], detail=TRUE))
 
 }
-
+# raw_photoData <- tar_read(raw_photoData)
 
 
 
 # Process photo-ID observations -------------------------------------------
 process_photoID <- function(lv_data, chosen_side, chosen_canyons){
 
-  # check that Gully is keyworded appropriately in 2021 data
+  # Manual edits for 2024
+  # 1. Several photos with erroneous metadata, including times 
+  photos_with_errors <- c('NBW_20240721_DSC_8272.NEF',
+                          'NBW_20240721_DSC_8271.NEF',
+                          'NBW_20240721_DSC_8267.NEF')
+  lv_data <- lv_data[!(File.name %in% photos_with_errors),,]
+  # 2. Fix to IDs 1317, 6018, 6402
+  lv_data[Title==1317 & year(Date.Original)==2021, Title:=6018,]
+  lv_data[Title==6402, Title:=6018, ]
+  # all share unknown sex
+  # 3. Fix to photograph with erroneous ID
+  lv_data[File.name=='NBW_20240720_NB2_3650.JPG',Title:=6515,]
 
   # extract side information
   lv_data[,side:=ifelse(grepl("Left Side", Keyword.export),"Left","Right"),] # extract side from keyword list
@@ -247,27 +290,23 @@ carve_groups <- function(photoData, meta) {
   # Create a group identifier based on the threshold
   photoData[, myGroups := cumsum(time_diff > 10) + 1]
 
-  ## No longer necessary
-
-  # length(unique(photoData$myGroups)) # check number of timegroups
-  #
-  # for (i in 1:length(unique(photoData$myGroups))-1) {
-  #
-  #   last_ID <- photoData[myGroups==i, max(dateTime)]
-  #   next_ID <- photoData[myGroups==(i+1), min(dateTime)]
-  #
-  #   if (as.numeric(difftime(next_ID, last_ID, units = 'mins')) < 5) {
-  #     photoData[myGroups==i, myGroups:=i+1]
-  #   }
-  # }
-  #
-  # length(unique(photoData$myGroups)) # check how many timegroups remain
-
+  # Summary statistics - group size and duration
   photoData[,groupSize:=as.numeric(length(unique(Title))),by=myGroups]
-  hist(photoData$groupSize)
-
-  photoData[,adultTitle:=ifelse(ageClass=='Adult',Title,NA),]
-  #photoData[,groupSizeAdult:=as.numeric(length(unique(na.omit(adultTitle)))),by=myGroups]
+  photoData[, minTime:=min(dateTime), by=myGroups]
+  photoData[, maxTime:=max(dateTime), by=myGroups]
+  photoData[, groupDur:=as.numeric(maxTime-minTime, units='mins'), by=myGroups] # in minutes
+  # extract unique
+  u_groups <- unique(photoData[,c('myGroups','groupSize', 'groupDur')])
+  # group size
+  hist(u_groups$groupSize)
+  range(u_groups$groupSize) # range 1-27
+  median(u_groups$groupSize) # median 2
+  mean(u_groups$groupSize) # mean 2.4
+  # group duration
+  hist(u_groups$groupDur)
+  range(u_groups$groupDur) # range 0-74 mins
+  median(u_groups$groupDur) # median 1 min
+  mean(u_groups$groupDur) # mean 4.4 mins
 
   # subset to one row per group per individual
   group_ind_data <- unique(photoData[,c('Title','year', 'groupSize','myGroups')])
@@ -346,6 +385,43 @@ extract_within_effects <- function(multi_dataset, m) {
 # multi_dataset <- tar_read(multi_dataset_ma)
 
 
+# Extract within-individual effects for minimum age ---------------------------------------
+# Note that this function uses "coef" and is intended to combine varying slopes with average trait-specific within-individual effects
+extract_within_effects_minimum <- function(multi_dataset, m) {
+  
+  c <- coef(m, prob=c(0.95, 0.05))$Title
+  
+  gs <- data.frame(c[,,"gsannual_minimumAge"])
+  colnames(gs) <- paste('gsannual_',colnames(gs),sep='')
+  gs$Title <- rownames(gs)
+  
+  degree <- data.frame(c[,,"degree_minimumAge"])
+  colnames(degree) <- paste('degree_',colnames(degree),sep='')
+  degree$Title <- rownames(degree)
+  
+  strength <- data.frame(c[,,"strength_minimumAge"])
+  colnames(strength) <- paste('strength_',colnames(strength),sep='')
+  strength$Title <- rownames(strength)
+  
+  eigen <- data.frame(c[,,"eigen_minimumAge"])
+  colnames(eigen) <- paste('eigen_',colnames(eigen),sep='')
+  eigen$Title <- rownames(eigen)
+  
+  meanEdge <- data.frame(c[,,"medianEdge_minimumAge"])
+  colnames(meanEdge) <- paste('meanEdge_',colnames(meanEdge),sep='')
+  meanEdge$Title <- rownames(meanEdge)
+  
+  # combine effects for different traits
+  combined <- Reduce(merge, list(gs, degree, strength, eigen, meanEdge))
+  
+  # incorporating sex information
+  dt <- merge(combined, unique(multi_dataset[,c('Title','sex'),]),by='Title', all.x=TRUE, all.y=FALSE)
+  
+  return(dt)
+  
+}
+# m <- tar_read(m_multi_both_ma_minimum)
+# multi_dataset <- tar_read(multi_dataset_ma)
 
 
 # Extract within-individual effects ---------------------------------------
@@ -392,7 +468,7 @@ extract_within_effects_sex_specific <- function(multi_dataset, m) {
 # Plot within-individual effects ------------------------------------------
 plot_within_effect <- function(w, traitX, traitY) {
 
-  w$sex <- factor(w$sex, levels=c('Female-Juvenile','Male'))
+  w$sex <- factor(w$sex, levels=c('FemaleJ','Male'))
 
   ggplot(w, aes(x=get(paste(traitX,'_Estimate',sep='')), y=get(paste(traitY, '_Estimate',sep='')), color=sex))+
     geom_point(alpha=0.75,size=2) +
@@ -413,7 +489,7 @@ plot_within_effect <- function(w, traitX, traitY) {
 plot_within_effect_sex_specific <- function(w_f, w_m, traitX, traitY) {
   
   w <- rbindlist(list(w_f, w_m))
-  w$sex <- factor(w$sex, levels=c('Female-Juvenile','Male'))
+  w$sex <- factor(w$sex, levels=c('FemaleJ','Male'))
   
   ggplot(w, aes(x=get(paste(traitX,'_Estimate',sep='')), y=get(paste(traitY, '_Estimate',sep='')), color=sex))+
     geom_point(alpha=0.4,size=2) +
@@ -569,7 +645,7 @@ extract_trait_multiAnnual <- function(fit) {
     edge_samples <- all_edge_samples[,(str_extract(colnames(all_edge_samples), "(?<=\\.)\\d+")==y)]
     colnames(edge_samples) <- str_remove(colnames(edge_samples), "\\.\\d+")
     
-    N_draws <- 100
+    N_draws <- 1000
     
     # number of nodes (probably more efficient way to do this)
     nodes <- unique(c(sub("^(\\d+)_.*", "\\1", colnames(edge_samples)), sub("^\\d+_(\\d+)$", "\\1", colnames(edge_samples))))
@@ -677,7 +753,139 @@ extract_trait_multiAnnual <- function(fit) {
   return(combined)
   
 }
-# fit <- tar_read(brms_fit_group_zeroinfl_multiAnnual)
+# fit <- tar_read(brms_fit_group_multiAnnual)
+
+
+
+# Extract network traits --------------------------------------------------
+extract_trait_multiAnnual_imputation <- function(fit, N_draws) {
+  
+  # extract all edge samples
+  all_edge_samples <- data.frame(coef(fit, summary=FALSE)[[1]])
+  colnames(all_edge_samples) <- str_extract(colnames(all_edge_samples), "\\d+_\\d+\\.\\d+")
+  
+  # extract year group and proper dyad names
+  d <- data.table(fit$data)
+  d[,year_group:=str_extract(dyad_annual, "(?<=-)[0-9]+$"), by=.I]
+  d[,dyad:=str_extract(dyad_annual, "^\\d+_\\d+"), by=.I]  
+  
+  # Randomly select draws to use in advance
+  chosen_draws <- sample(1:nrow(all_edge_samples), size = N_draws, replace = FALSE)    
+  
+  # year groups to loop through
+  years <- unique(d$year_group)
+  years <- years[!years %in% c(4, 18)]
+  
+  # Initialize result
+  result <- list()
+  
+  # loop through draws
+  for (draw in chosen_draws) {
+    
+    # set output to NULL
+    output <- NULL
+    
+    # loop through years
+    for (y in years) {
+      
+      # extract relevant edge weights for given year
+      annual_edge_samples <- all_edge_samples[,(str_extract(colnames(all_edge_samples), "(?<=\\.)\\d+")==y)]
+      colnames(annual_edge_samples) <- str_remove(colnames(annual_edge_samples), "\\.\\d+")
+      
+      # pull draw of complete network (i.e., of each edge weight)
+      draw_of_network <- as.data.frame(t(annual_edge_samples[draw,])) # probably more efficient way to do this (i.e., full matrix...)
+      if (nrow(draw_of_network)==1) (rownames(draw_of_network) <- colnames(annual_edge_samples)) # for 1991 with 2 photos... can simply delete this year too maybe
+      colnames(draw_of_network) <- 'weight_sample_raw'
+      
+      # format IDs out of dyad label
+      draw_of_network$A <- sub("^(\\d+)_.*", "\\1", rownames(draw_of_network)) # pull out ID A
+      draw_of_network$B <- sub("^\\d+_(\\d+)$", "\\1", rownames(draw_of_network)) # pull out ID B
+      
+      ###########################################################
+      ### Create main network with all Bayesian uncertainties ###
+      
+      # create network
+      net <- igraph::graph_from_edgelist(as.matrix(draw_of_network[,c('A','B'),]), directed=FALSE)
+      # add in edgeweights
+      igraph::E(net)$weight <- inv_logit(draw_of_network[,c('weight_sample_raw'),]) # inv-logit here because it's a bernoulli model # confirm makes sense to transform prior to strength calculation
+      
+      # create version of network without 0s
+      fitData <- d[year_group==y,,]
+      fitData[,nTogether:=sum(together),by=dyad]
+      nonZero_dyads <- unique(fitData[nTogether>0,c('dyad')])$dyad
+      
+      NZ_draw_of_network <- data.table(copy(draw_of_network))
+      NZ_draw_of_network[,dyad:=rownames(draw_of_network)]
+      NZ_draw_of_network[,weight:=inv_logit(weight_sample_raw),] # inv-logit transformation
+      # now set dyads that were never together as 0s
+      NZ_draw_of_network[!(dyad %in% nonZero_dyads), weight:=NA,]
+      
+      NZ_net <- igraph::graph_from_edgelist(as.matrix(NZ_draw_of_network[,c('A','B'),]), directed=FALSE)
+      #plot(NZ_net)
+      
+      igraph::E(NZ_net)$weight <- NZ_draw_of_network[,weight,] ###### inv-logit here because it's a binary model # confirm makes sense to transform prior to strength calculation
+      NZ_net <- delete_edges(NZ_net, E(NZ_net)[is.na(E(NZ_net)$weight)])
+      
+      # plot network if desired
+      # plot(net)
+      
+      ## Add traits
+      
+      # Strength
+      strength_df <- as.data.frame(igraph::strength(net))
+      strength_df$Title <- rownames(strength_df)
+      strength_df <- data.table(strength_df)
+      colnames(strength_df) <- c('strength', 'Title')
+      
+      # Centrality
+      centrality_df <- as.data.frame(igraph::eigen_centrality(net)$vector)
+      centrality_df$Title <- rownames(centrality_df)
+      centrality_df <- data.table(centrality_df)
+      colnames(centrality_df) <- c('eigen', 'Title')
+      centrality_df[eigen==1,eigen:=eigen-0.0001,]
+      centrality_df[eigen==0,eigen:=eigen+0.0001,]
+      
+      
+      # Mean relationship 
+      # For mean non-0 edge weight
+      meanRel_df <- data.table(Title=strength_df$Title)
+      
+      for (name in strength_df$Title) {
+
+        # extract edge weights using igraph and cut below 5% threshold
+        focal_weights <- data.table(dyad=incident(net,v=name), weight=(incident(net,v=name))$weight)
+        #focal_weights_nonZero <- focal_weights[focal_weights>=0.05] # using 5% for Bayesian weight right now - could use real data (i.e., trim those never seen together or consider alternate threshold)
+        focal_weights_nonZero <- data.table(dyad=incident(NZ_net,v=name), weight=(incident(NZ_net,v=name))$weight)
+        
+        # save out mean edge weight by ID
+        meanRel_df[Title==name,meanEdge:=mean(focal_weights_nonZero$weight),]
+        meanRel_df[is.nan(meanEdge),meanEdge:=NA,]
+      
+      }
+
+      # format nodal measures
+      nodals <- merge(strength_df, centrality_df, by='Title')
+      nodals <- merge(nodals, meanRel_df, by='Title')
+      nodals$year_group <- y
+    
+      # Save results from each year to draw-specific output
+      output <- rbindlist(list(output, nodals)) # if output is null at start, will simply give trait_df
+      
+    }
+    
+    # Save results from single draw to main results
+    result <- c(result, list(output[,ID:=Title,]))
+    # result <- c(result, list(as.data.frame(output)))
+    
+    
+  }
+  
+  return(result)
+  
+}
+# fit <- tar_read(brms_fit_group_multiAnnual)
+# N_draws <- 3
+
 
 
 
@@ -764,7 +972,6 @@ within_between_plot <- function(fit, traitName, traitLabel, sex) {
 # traitName <- 'eigen'
 # traitLabel <- 'Centrality (std.)'
 # sex='Male'
-
 
 
 
@@ -953,12 +1160,11 @@ biopsySexTitles <- function(d) {
 
 
 
-
 # Plot GAMs ---------------------------------------------------------------
 smooth_plot <- function(fit, traitName, traitLabel, show_data, add_legend) {
   
   # colors
-  cols <- c('Male' = '#762F7C', 'Female-Juvenile' = '#db874f')
+  cols <- c('Male' = '#762F7C', 'FemaleJ' = '#db874f')
   
   # data
   data <- data.table(fit$data)
@@ -974,7 +1180,7 @@ smooth_plot <- function(fit, traitName, traitLabel, show_data, add_legend) {
   pred <- data.table(epred_draws(fit, newdata, re_formula=NA))
   pred_means <- pred[, .(mean_epred=mean(.epred)),by=c('sex', 'minimumAge')] # extract means for each combination predictors (if not interested in plotting whole ribbon!)
   
-  pred$sex <- factor(pred$sex, levels=c('Male', 'Female-Juvenile'))
+  pred$sex <- factor(pred$sex, levels=c('Male', 'FemaleJ'))
   
   g <- ggplot(pred, aes(x=minimumAge, y=.epred, color=sex, fill=sex)) +
     
@@ -1007,6 +1213,10 @@ smooth_plot <- function(fit, traitName, traitLabel, show_data, add_legend) {
 # show_data <- FALSE
 # add_legend <- TRUE
 
+# fit <- tar_read(m12_smooth2_freek)
+# fit <- tar_read(m12_smooth2_no2024)
+# fit <- tar_read(m12_smooth2_2024)
+# fit <- tar_read(m12_smooth2_2023)
 
 
 # Add degree to dataframe -------------------------------------------------
@@ -1053,73 +1263,172 @@ add_degree_ma <- function(side, associations, model_df, year_key) {
 
 
 
+# # Build NBW metadata ------------------------------------------------------
+# # takes raw LV output as input ('dt')
+# build_nbw_metadata <- function(dt, chosen_side) {
+# 
+#   # format dates
+#   dt[,dateTime:=as.POSIXct(Date.Original),]
+#   dt[,day:=format(dateTime, format = "%Y-%m-%d")]
+#   dt[,year:=year(day),]
+# 
+#   # remove photographs that were processed as crops
+#   dt <- dt[Title!="see crops",,]
+#   dt <- dt[Title!="unk",,]
+# 
+#   # add left and right columns
+#   # dt=dt %>% mutate(side = ifelse(grepl("left", Keyword.export), "left", NA))
+#   # dt=dt %>% mutate(side = ifelse(grepl("right", Keyword.export), "right", NA))
+#   #
+#   dt[grepl("Left", Keyword.export), side := "left"]
+#   dt[grepl("Right", Keyword.export), side := "right"]
+# 
+#   # subset to chosen side
+#   dt <- dt[side==chosen_side,,]
+# 
+#   # add columns with sex details
+#   dt=dt%>%mutate(sex = ifelse(grepl("FemaleJ", Keyword.export), "Female-Juvenile", NA))
+#   dt=dt%>%mutate(sex = ifelse(grepl("Male", Keyword.export), "Male", sex))
+#   dt$sex <- factor(dt$sex,levels=c("Female-Juvenile","Male"))
+# 
+#   # Juv and Calf classifications (using SFW's ratings)
+#   dt[,ageClass:=ifelse(grepl('samCalf', Keyword.export),'Calf','Adult'),by=c('Title','year')] # really more like "not young"
+#   dt[ageClass!='Calf',ageClass:=ifelse(grepl('samJuv', Keyword.export),'Juvenile',ageClass),by=c('Title','year')]
+#   dt[,young:=ageClass %in% c('Calf','Juvenile'),by=c('Title','year')]
+# 
+#   # add minimum age by year
+#   dt[,minYear:=min(year),by=Title]
+#   dt[,maxYear:=max(year),by=Title]
+#   dt[,yearSpan:=1+(maxYear-minYear),by=Title]
+#   dt[,catalogueAge:=year-minYear,] # Note: considering first year as "0"
+# 
+#   ## photo-ID error fix
+#   dt[Title==6527 & year==2021,ageClass:='Juvenile',]
+# 
+#   dt[, FirstYearAgeClass := unique(ageClass[minYear == year]), by = Title]
+# 
+#   dt[FirstYearAgeClass=='Calf',minimumAge:=catalogueAge,]
+#   dt[FirstYearAgeClass=='Juvenile',minimumAge:=catalogueAge+1,]
+#   dt[FirstYearAgeClass=='Adult',minimumAge:=catalogueAge+3,]
+# 
+#   # add day of year
+#   dt[,yday:=yday(day),]
+# 
+#   # diagnostic tests
+#   test_that("single sex classification for each individual", {
+#     expect_true(unique(dt[,length(unique(sex)),by=Title]$V1)==1)
+#   })
+# 
+#   test_that("single minimum age for each individual in each year", {
+#     expect_true(unique(dt[,length(unique(minimumAge)),by=c('Title', 'year'),]$V1)==1)
+#   })
+# 
+#   # sample one observation per individual per year and clean up dataset
+#   subsampled <- dt[dt[ , .I[sample(.N,1)] , by = c('Title','year')]$V1]
+#   meta <- subsampled[,c('Title', 'side', 'year', 'sex', 'minYear', 'maxYear', 'yearSpan', 'minimumAge', 'ageClass', 'yday'), ]
+# 
+#   return(meta)
+# 
+# }
+# # dt <- tar_read(raw_photoData)
+# # chosen_side = 'left'
+
+
 
 # Build NBW metadata ------------------------------------------------------
 # takes raw LV output as input ('dt')
 build_nbw_metadata <- function(dt, chosen_side) {
-
+  
+  # Edits for 2024
+  dt[Title==1317 & year(Date.Original)==2021, Title:=6018,]
+  dt[Title==6402, Title:=6018, ]
+  
+  # # Manual edits for 2024
+  # # 1. Several photos with erroneous metadata, including times 
+  # photos_with_errors <- c('NBW_20240721_DSC_8272.NEF',
+  #                         'NBW_20240721_DSC_8271.NEF',
+  #                         'NBW_20240721_DSC_8267.NEF')
+  # dt <- dt[!(File.name %in% photos_with_errors),,]
+  # # 2. Fix to IDs 1317, 6018, 6402
+  # dt[Title==1317 & year(Date.Original)==2021, Title:=6018,]
+  # dt[Title==6402, Title:=6018, ]
+  # # 3. Fix to photograph with erroneous ID
+  # dt[File.name=='NBW_20240720_NB2_3650.JPG',Title:=6515,]
+  
   # format dates
   dt[,dateTime:=as.POSIXct(Date.Original),]
   dt[,day:=format(dateTime, format = "%Y-%m-%d")]
   dt[,year:=year(day),]
-
+  
   # remove photographs that were processed as crops
   dt <- dt[Title!="see crops",,]
   dt <- dt[Title!="unk",,]
-
+  
+  # DO RESIDENCY BEFORE restricting by side 
+  dt[,residency:=ifelse(length(unique(year))==1, 'Transient', 'Resident'),by=Title]
+  dt[residency=='Transient' & year %in% c(1988, 2024),residency:='Unknown',] # Changed to 2024, now most recent year of data
+  
   # add left and right columns
-  # dt=dt %>% mutate(side = ifelse(grepl("left", Keyword.export), "left", NA))
-  # dt=dt %>% mutate(side = ifelse(grepl("right", Keyword.export), "right", NA))
-  #
   dt[grepl("Left", Keyword.export), side := "left"]
   dt[grepl("Right", Keyword.export), side := "right"]
-
+  
   # subset to chosen side
   dt <- dt[side==chosen_side,,]
-
+  
+  # reliability
+  dt[,reliability:='Not reliable',]
+  dt[grepl('Notch|Back Indent|Nick', Keyword.export), reliability:='Reliable',by=c('Title','year')] # Changed to include Nick in 2025
+  
   # add columns with sex details
-  dt=dt%>%mutate(sex = ifelse(grepl("FemaleJ", Keyword.export), "Female-Juvenile", NA))
-  dt=dt%>%mutate(sex = ifelse(grepl("Male", Keyword.export), "Male", sex))
-  dt$sex <- factor(dt$sex,levels=c("Female-Juvenile","Male"))
-
-  # Juv and Calf classifications (using SFW's ratings)
-  dt[,ageClass:=ifelse(grepl('samCalf', Keyword.export),'Calf','Adult'),by=c('Title','year')] # really more like "not young"
-  dt[ageClass!='Calf',ageClass:=ifelse(grepl('samJuv', Keyword.export),'Juvenile',ageClass),by=c('Title','year')]
-  dt[,young:=ageClass %in% c('Calf','Juvenile'),by=c('Title','year')]
-
-  # add minimum age by year
+  dt[, sex:=ifelse(grepl("Unknown", Keyword.export), "Unknown", NA), ]
+  dt[, sex:=ifelse(grepl("FemaleJ", Keyword.export), "FemaleJ", sex), ]
+  dt[, sex:=ifelse(grepl("Male", Keyword.export), "Male", sex), ]
+  # old version below
+  # dt=dt%>%mutate(sex = ifelse(grepl("FemaleJ", Keyword.export), "Female-Juvenile", NA))
+  # dt=dt%>%mutate(sex = ifelse(grepl("Male", Keyword.export), "Male", sex))
+  # dt$sex <- factor(dt$sex,levels=c("Female-Juvenile","Male"))
+  
+  # Step 1: Assign 'Calf' or 'Adult' based on 'Keyword.export'
+  dt[, ageClass := ifelse(grepl('ageCalf', Keyword.export), 'Calf', 'Adult')]
+  
+  # Step 2: Further refine 'ageClass' for non-'Calf' rows to include 'Juvenile'
+  dt[ageClass == 'Adult' & grepl('ageJuv', Keyword.export), ageClass := 'Juvenile']
+  
+  # Step 3: Create 'young' column indicating if the individual is either 'Calf' or 'Juvenile'
+  dt[, young := ageClass %in% c('Calf', 'Juvenile')]
+  
+  # # add minimum age by year
   dt[,minYear:=min(year),by=Title]
   dt[,maxYear:=max(year),by=Title]
   dt[,yearSpan:=1+(maxYear-minYear),by=Title]
   dt[,catalogueAge:=year-minYear,] # Note: considering first year as "0"
-
-  ## photo-ID error fix
-  dt[Title==6527 & year==2021,ageClass:='Juvenile',]
-
+  
   dt[, FirstYearAgeClass := unique(ageClass[minYear == year]), by = Title]
-
+  
   dt[FirstYearAgeClass=='Calf',minimumAge:=catalogueAge,]
   dt[FirstYearAgeClass=='Juvenile',minimumAge:=catalogueAge+1,]
   dt[FirstYearAgeClass=='Adult',minimumAge:=catalogueAge+3,]
-
+  
+  dt[,minAge_in_2030:=(2030-year)+minimumAge,]
+  
   # add day of year
   dt[,yday:=yday(day),]
-
+  
   # diagnostic tests
   test_that("single sex classification for each individual", {
     expect_true(unique(dt[,length(unique(sex)),by=Title]$V1)==1)
   })
-
-  test_that("single minimum age for each individual in each year", {
-    expect_true(unique(dt[,length(unique(minimumAge)),by=c('Title', 'year'),]$V1)==1)
-  })
-
+  
+  # test_that("single minimum age for each individual in each year", {
+  #   expect_true(unique(dt[,length(unique(minimumAge)),by=c('Title', 'year'),]$V1)==1)
+  # })
+  #
   # sample one observation per individual per year and clean up dataset
   subsampled <- dt[dt[ , .I[sample(.N,1)] , by = c('Title','year')]$V1]
-  meta <- subsampled[,c('Title', 'side', 'year', 'sex', 'minYear', 'maxYear', 'yearSpan', 'minimumAge', 'ageClass', 'yday'), ]
-
+  meta <- subsampled[,c('Title', 'side', 'year', 'sex', 'minYear', 'maxYear', 'yearSpan', 'ageClass', 'yday', 'minimumAge', 'minAge_in_2030', 'residency', 'reliability'), ]
+  
   return(meta)
-
+  
 }
 # dt <- tar_read(raw_photoData)
 # chosen_side = 'left'
@@ -1129,7 +1438,6 @@ build_nbw_metadata <- function(dt, chosen_side) {
 
 # Add age info to metadata ------------------------------------------------
 add_age_to_meta <- function(dt) {
-
 
   dt <- dt[year>=2000,,]
   dt <- dt[ageClass=='Adult',,]
@@ -1252,7 +1560,6 @@ year_key <- function(g) {
 
 
 
-
 # Combine group associations for summarizing ------------------------------
 aggregate_group_associations <- function(g) {
   
@@ -1268,6 +1575,109 @@ aggregate_group_associations <- function(g) {
 # g <- tar_read(group_associations_all)
 
 
+
+
+# Plot credible intervals of individual-specific slopes -------------------
+plot_within_slopes <- function(fit) {
+  
+  # Extract coefficients
+  ranef_slopes <- coef(fit, prob = c(0.05, 0.95))$Title  # Replace 'Title' with actual grouping factor
+  
+  # Extract the relevant coefficient for deltaMinAge
+  delta_slopes <- ranef_slopes[,, 'deltaMinAge']  # Adjust if using a nested structure
+  
+  # Convert to dataframe
+  df <- data.frame(
+    Title = rownames(delta_slopes),  # Assuming individuals/groups as row names
+    Estimate = delta_slopes[, "Estimate"],
+    CI_low = delta_slopes[, "Q5"], 
+    CI_high = delta_slopes[, "Q95"]
+  )
+  
+  g <- ggplot(df, aes(x = reorder(Title, Estimate), y = Estimate)) +
+    geom_pointrange(aes(ymin = CI_low, ymax = CI_high, color = (CI_low > 0 | CI_high < 0)), 
+                    size = 0.2, linewidth=0.75) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth=0.1) +
+    coord_flip() +
+    scale_color_manual(values = c("grey", "red"), labels = c("Includes 0", "Excludes 0")) +
+    labs(x = "ID", y = "Random Slope for deltaMinAge", 
+         title = "Credible Intervals of Random Slopes for deltaMinAge",
+         color = "CI Relationship to Zero") +
+    theme_minimal()
+  
+  return(g)
+  
+}
+# fit <- tar_read(ma_m2)
+
+
+
+edge_diagnostics <- function(edgelist, associations, multi) {
+  
+  edgelist$year_group <- as.numeric(edgelist$year_group)
+  combined <- merge(edgelist, associations, by=c('dyad', 'year_group'))
+  
+  combined[,never_together:=ifelse(together==0,'never together','together at least once'),]
+  
+  g <- ggplot(combined, aes(x=sum_opps, y=edge, group=never_together, color=never_together)) + 
+    facet_wrap(~never_together)+
+    geom_linerange(aes(ymin = lower_edge, ymax = upper_edge), linewidth = 1, color = 'yellow') +  # Add vertical error bars for CIs
+    geom_jitter(alpha=0.1, color='grey30') + 
+    geom_smooth(linewidth=2, se = FALSE) + 
+    scale_color_manual(values=c('turquoise', 'navy'))+
+    xlim(0,25)+
+    theme_classic()
+  
+  return(g)
+  
+}
+# edgelist <- tar_read(edges_group_ma)
+# associations <- tar_read(group_associations_all_aggregated)
+# multi <- TRUE
+
+
+
+
+# Pull out edges
+edge_list_multiAnnual <- function(fit, include_zeros) {
+  
+  # identify non-zero dyads
+  m_data <- data.table(fit$data)
+  m_data[,dyad:=dyad_annual,]
+  m_data[,nAssociations:=sum(together),by=dyad_annual]
+  nz_dyads <- m_data[nAssociations>=1,unique(dyad_annual),]
+  
+  # for multi-annual only
+  nz_dyads <- str_extract(nz_dyads, "^\\d+_\\d+")
+  
+  # extract edge weights
+  edges <- data.frame(coef(fit))
+  edges$dyad <- rownames(edges)
+  edges <- data.table(edges)
+  edges[,edge:=inv_logit(dyad_annual.Estimate.Intercept),] ###### is this correct for the zero-inflated model as well?
+  edges[,lower_edge:=inv_logit(dyad_annual.Q2.5.Intercept),] ###### is this correct for the zero-inflated model as well?
+  edges[,upper_edge:=inv_logit(dyad_annual.Q97.5.Intercept),] ###### is this correct for the zero-inflated model as well?
+  
+  ###### think on whether I need to manage transformation of error some other way?
+  
+  edges <- merge(edges, unique(m_data[,c('dyad', 'nAssociations'),]), by='dyad')
+  
+  # for multi-annual
+  edges[,year_group:=str_extract(dyad, "(?<=-)[0-9]+$"), by=.I]
+  edges[,dyad:=str_extract(dyad, "^\\d+_\\d+"), by=.I]
+  
+  ###### so sd of transformed samples quite different from est. error -- need to figure out what's going on here and which we want to use
+  # ask on brms forum or ask Jordan Hart directly
+  
+  # exclude non-zero dyads if necessary
+  if (!include_zeros) (edges <- edges[dyad %in% nz_dyads,,])
+  
+  return(edges)
+  
+  
+}
+# fit <- tar_read(brms_fit_group_multiAnnual)
+# include_zeros <- TRUE
 
 
 
